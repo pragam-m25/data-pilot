@@ -25,6 +25,7 @@ export default function AskDataPage() {
   const [asking, setAsking] = useState(false);
   const [executing, setExecuting] = useState(false);
   const [history, setHistory] = useState<any[]>([]);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   async function loadInitial() {
     try {
@@ -53,6 +54,7 @@ export default function AskDataPage() {
     setAsking(true);
     setQueryState(null);
     setExecutionResult(null);
+    setErrorMsg(null);
 
     try {
       const res = await fetchApi("/api/v1/query/ask", {
@@ -64,7 +66,7 @@ export default function AskDataPage() {
       });
       setQueryState(res);
     } catch (e: any) {
-      alert("Error resolving inquiry: " + e.message);
+      setErrorMsg("Error resolving inquiry: " + e.message);
     } finally {
       setAsking(false);
     }
@@ -73,6 +75,7 @@ export default function AskDataPage() {
   async function handleExecute() {
     if (!queryState?.query_id) return;
     setExecuting(true);
+    setErrorMsg(null);
     try {
       const res = await fetchApi("/api/v1/query/execute", {
         method: "POST",
@@ -86,7 +89,7 @@ export default function AskDataPage() {
       const hist = await fetchApi("/api/v1/query/history?limit=10");
       if (Array.isArray(hist)) setHistory(hist);
     } catch (e: any) {
-      alert("Execution error: " + e.message);
+      setErrorMsg("Execution error: " + e.message);
     } finally {
       setExecuting(false);
     }
@@ -173,9 +176,48 @@ export default function AskDataPage() {
         </div>
       </div>
 
+      {/* Inline Execution / Query Error Notice */}
+      {errorMsg && (
+        <div className="p-4 rounded-xl border border-rose-300 dark:border-rose-900 bg-rose-50 dark:bg-rose-950/40 text-xs space-y-1.5 animate-in fade-in">
+          <div className="flex items-center justify-between font-bold text-rose-800 dark:text-rose-300">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 text-rose-600 dark:text-rose-400" />
+              <span>Query Execution Notice</span>
+            </div>
+            <button
+              onClick={() => setErrorMsg(null)}
+              className="text-[10px] uppercase tracking-wider text-rose-600 dark:text-rose-400 hover:underline font-bold"
+            >
+              Dismiss
+            </button>
+          </div>
+          <p className="text-rose-900 dark:text-rose-200 font-mono text-[11px] leading-relaxed break-words">
+            {errorMsg}
+          </p>
+        </div>
+      )}
+
       {/* Query Resolution State */}
       {queryState && (
         <div className="space-y-4">
+          {/* Case 0: Schema / SQL Validation Error */}
+          {queryState.status === "validation_error" && (
+            <div className="p-4 rounded-xl border border-rose-300 dark:border-rose-900 bg-rose-50 dark:bg-rose-950/30 space-y-2 text-xs">
+              <div className="flex items-center gap-2 text-rose-800 dark:text-rose-300 font-bold">
+                <AlertTriangle className="h-4 w-4 text-rose-600" />
+                <span>Schema Validation Notice</span>
+              </div>
+              <p className="text-rose-900 dark:text-rose-200 leading-relaxed font-mono">
+                {queryState.message}
+              </p>
+              {queryState.raw_sql && (
+                <pre className="p-2 rounded bg-rose-100/50 dark:bg-rose-900/30 text-[10px] text-rose-900 dark:text-rose-200 overflow-x-auto whitespace-pre-wrap">
+                  {queryState.raw_sql}
+                </pre>
+              )}
+            </div>
+          )}
+
           {/* Case 1: Missing Metric Definition */}
           {queryState.status === "needs_definition" && (
             <div className="p-4 rounded-xl border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 space-y-2 text-xs">

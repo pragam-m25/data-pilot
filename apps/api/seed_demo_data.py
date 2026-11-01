@@ -92,7 +92,7 @@ if not src:
     db.commit()
 
 # 4. Create approved MetricDefinition
-metric = db.query(MetricDefinition).filter(MetricDefinition.workspace_id == ws.id).first()
+metric = db.query(MetricDefinition).filter(MetricDefinition.workspace_id == ws.id, MetricDefinition.id == "metric_net_rev").first()
 if not metric:
     metric = MetricDefinition(
         id="metric_net_rev",
@@ -100,7 +100,7 @@ if not metric:
         name="Net Revenue",
         description="Total recognized revenue excluding cancelled and refunded orders.",
         formula_sql="SUM(amount)",
-        source_tables_json=["source_data"],
+        source_tables_json=["saas_orders_v1", "saas_orders_sample.csv"],
         grain="order",
         time_column="created_at",
         default_filters_json=[{"column": "status", "op": "!=", "val": "cancelled"}],
@@ -116,8 +116,32 @@ if not metric:
     db.commit()
     db.refresh(metric)
 
+# 4b. Ecommerce metrics
+metric_ecom = db.query(MetricDefinition).filter(MetricDefinition.workspace_id == ws.id, MetricDefinition.id == "metric_ecom_net_rev").first()
+if not metric_ecom:
+    metric_ecom = MetricDefinition(
+        id="metric_ecom_net_rev",
+        workspace_id=ws.id,
+        name="Net Revenue",
+        description="Recognized revenue from completed ecommerce orders excluding cancellations.",
+        formula_sql="SUM(recognized_revenue_inr)",
+        source_tables_json=["datapilot_ecommerce_test_data.csv", "source_data"],
+        grain="order",
+        time_column="order_date",
+        default_filters_json=[{"column": "order_status", "op": "!=", "val": "Cancelled"}],
+        allowed_dimensions_json=["region", "state", "city", "category", "sales_channel", "customer_segment", "payment_method"],
+        unit="INR",
+        currency="₹",
+        owner="Finance Team",
+        status="approved",
+        version=1,
+        approved_by="Finance Lead"
+    )
+    db.add(metric_ecom)
+    db.commit()
+
 # 5. Create approved Glossary Term
-term = db.query(BusinessTerm).filter(BusinessTerm.workspace_id == ws.id).first()
+term = db.query(BusinessTerm).filter(BusinessTerm.workspace_id == ws.id, BusinessTerm.id == "term_paid_order").first()
 if not term:
     term = BusinessTerm(
         id="term_paid_order",

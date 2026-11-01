@@ -7,13 +7,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import duckdb
+import sqlglot
+from sqlglot import exp
 from pydantic import BaseModel, Field
 
+from app.core.config import get_duckdb_path
 from app.models.models import MetricDefinition, BusinessTerm, DataSource
 from app.services.query.sql_validator import validate_and_format_sql, SQLValidationError
 from app.services.llm.factory import get_llm_adapter
@@ -94,6 +98,42 @@ INSTRUCTIONS:
         logger.warning(f"LLM intent resolution fallback to deterministic matching: {e}")
         return None
 
+def get_metric_column_requirements(metric: MetricDefinition) -> Tuple[List[str], List[str]]:
+    """Extract column names required by metric's formula and default filters."""
+    formula_cols = []
+    try:
+        parsed = sqlglot.parse_one(metric.formula_sql, read="duckdb")
+        formula_cols = [col.name.lower() for col in parsed.find_all(exp.Column)]
+    except Exception:
+        formula_cols = []
+
+    filter_cols = []
+    if isinstance(metric.default_filters_json, list):
+        for f in metric.default_filters_json:
+            if isinstance(f, dict) and "column" in f:
+                filter_cols.append(str(f["column"]).lower())
+
+    return formula_cols, filter_cols
+
+def check_metric_compatibility(
+    metric: MetricDefinition,
+    source: DataSource
+) -> Tuple[bool, List[str]]:
+    """
+    Validates whether all formula and filter columns required by the metric
+    actually exist in the target DataSource schema.
+    """
+    source_cols = {c.name.lower() for c in source.columns} if getattr(source, "columns", None) else set()
+    if not source_cols:
+        return True, []
+
+    formula_cols, filter_cols = get_metric_column_requirements(metric)
+    required = set(formula_cols) | set(filter_cols)
+    missing = [c for c in sorted(list(required)) if c not in source_cols]
+    if missing:
+        return False, missing
+    return True, []
+
 def resolve_nl_query_intent(
     question: str,
     terms: List[BusinessTerm],
@@ -103,7 +143,7 @@ def resolve_nl_query_intent(
     """
     Resolves a user's natural language question against approved business definitions.
     Returns:
-      - 'needs_definition': If the required business metric does not exist.
+      - 'needs_definition': If the required business metric does not exist or has schema mismatch.
       - 'needs_clarification': If multiple conflicting metrics match.
       - 'ready_to_execute': If an approved metric is resolved cleanly.
     """
@@ -116,7 +156,7 @@ def resolve_nl_query_intent(
         }
 
     q_norm = question.lower().strip()
-    metric_by_name = {m.name.lower(): m for m in metrics}
+    source_cols = {c.name.lower() for c in source.columns} if getattr(source, "columns", None) else set()
 
     # Step 1: Attempt LLM-based structured interpretation
     llm_res = _resolve_with_llm(question, metrics, terms)
@@ -139,7 +179,17 @@ def resolve_nl_query_intent(
                 }
 
         if llm_res.matched_metric_name:
-            matched_metric = metric_by_name.get(llm_res.matched_metric_name.lower())
+            # Check candidate metrics matching this name
+            matching_name_metrics = [
+                m for m in metrics if m.name.lower() == llm_res.matched_metric_name.lower()
+            ]
+            # Prioritize schema-compatible metric
+            compatible_m = [m for m in matching_name_metrics if check_metric_compatibility(m, source)[0]]
+            if compatible_m:
+                matched_metric = compatible_m[0]
+            elif matching_name_metrics:
+                matched_metric = matching_name_metrics[0]
+
             if matched_metric:
                 allowed = [d.lower() for d in (matched_metric.allowed_dimensions_json or [])]
                 selected_dims = [d for d in llm_res.selected_dimensions if d.lower() in allowed]
@@ -173,18 +223,39 @@ def resolve_nl_query_intent(
                 "suggested_action": "define_metric"
             }
 
-        if len(matched_metrics) > 1 and len(set(m.name for m in matched_metrics)) > 1:
-            candidates = [{"id": m.id, "name": m.name, "formula": m.formula_sql, "version": m.version} for m in matched_metrics]
-            return {
-                "status": "needs_clarification",
-                "question": question,
-                "message": "Multiple approved metrics match your question. Which definition should be applied?",
-                "candidates": candidates
-            }
-
-        matched_metric = matched_metrics[0]
+        # Filter candidate metrics by schema compatibility with the target source
+        compatible_matched = [m for m in matched_metrics if check_metric_compatibility(m, source)[0]]
+        if compatible_matched:
+            if len(compatible_matched) > 1 and len(set(m.name for m in compatible_matched)) > 1:
+                candidates = [{"id": m.id, "name": m.name, "formula": m.formula_sql, "version": m.version} for m in compatible_matched]
+                return {
+                    "status": "needs_clarification",
+                    "question": question,
+                    "message": "Multiple approved metrics match your question. Which definition should be applied?",
+                    "candidates": candidates
+                }
+            matched_metric = compatible_matched[0]
+        else:
+            matched_metric = matched_metrics[0]
 
     metric = matched_metric
+
+    # Step 2.5: Schema compatibility validation check
+    is_compat, missing_cols = check_metric_compatibility(metric, source)
+    if not is_compat:
+        cand_cols = sorted(list(source_cols))[:10]
+        return {
+            "status": "needs_definition",
+            "question": question,
+            "message": (
+                f"Approved metric '{metric.name}' expects column(s) {missing_cols}, "
+                f"which are not present in dataset '{source.name}'. "
+                f"Please define an approved metric mapped to the columns of '{source.name}' in Business Knowledge."
+            ),
+            "suggested_action": "define_metric",
+            "missing_columns": missing_cols,
+            "candidate_columns": cand_cols
+        }
 
     # Step 3: Determine dimensions requested if not already selected
     target_table = "source_data" if source.file_type in ["csv", "xlsx"] else (source.duckdb_table or "orders")
@@ -192,8 +263,15 @@ def resolve_nl_query_intent(
 
     if not selected_dims:
         for dim in available_dimensions:
-            if dim.lower() in q_norm or f"by {dim.lower()}" in q_norm:
+            d_low = dim.lower()
+            if d_low in q_norm or f"by {d_low}" in q_norm:
                 selected_dims.append(dim)
+            elif d_low.endswith("_status") and ("status" in q_norm or "by status" in q_norm):
+                selected_dims.append(dim)
+
+    # Restrict selected dimensions to columns that actually exist in the target source
+    if source_cols:
+        selected_dims = [d for d in selected_dims if d.lower() in source_cols]
 
     # Step 4: Construct reproducible, verifiable SQL
     formula = metric.formula_sql.strip()
@@ -237,6 +315,23 @@ def resolve_nl_query_intent(
             "message": f"Generated SQL failed security audit: {str(e)}",
             "raw_sql": sql_draft
         }
+
+    # Step 6: Database Binder verification (dry-run check for DuckDB files)
+    if source.file_type in ["csv", "xlsx"]:
+        duckdb_path = get_duckdb_path(source.id)
+        if os.path.exists(duckdb_path):
+            try:
+                dry_conn = duckdb.connect(duckdb_path, read_only=True)
+                dry_conn.execute(f"EXPLAIN {validated_sql}")
+                dry_conn.close()
+            except Exception as e:
+                err_msg = str(e)
+                logger.warning(f"DuckDB schema binder check caught mismatch: {err_msg}")
+                return {
+                    "status": "validation_error",
+                    "message": f"Generated SQL failed dataset schema validation: {err_msg}",
+                    "raw_sql": validated_sql
+                }
 
     explanation = (
         f"Calculates '{metric.name}' (v{metric.version}) using the approved business formula `{metric.formula_sql}`. "
